@@ -134,47 +134,84 @@ Bybit 거래소에서 USDT 무기한 선물을 대상으로 기술적 분석 기
 
 ## 서비스 구성
 
-### 1. Scanner Service (스캐너)
-**역할**: 거래 가능한 코인 스캔 및 필터링
+### 1. Scanner Service (스캐너) - 🆕 실시간 스캘핑 레이더
+**역할**: 300+ 코인 실시간 모니터링 및 기회 탐지
 
-**실행 방식**: EventBridge 스케줄 (1시간마다)
-**인스턴스 수**: 1개 (태스크 실행)
-**CPU/메모리**: 512 CPU / 1024 MB
+**실행 방식**: ECS Service (24/7 상시 실행) + WebSocket
+**인스턴스 수**: 1개 (고정)
+**CPU/메모리**: 1024 CPU / 2048 MB
 
 **주요 기능**:
 
-- Bybit에서 모든 USDT 무기한 선물 목록 조회
-- 거래량 필터링 (24시간 거래량 > $1M)
-- 변동성 필터링 (24시간 변동성 > 2%)
-- 스테이블코인 제외 (USDC, BUSD, DAI 등)
-- 스캔 결과를 DynamoDB에 저장
-- RabbitMQ `scan-results` 큐에 메시지 발행
+- **실시간 시장 스캔**: Bybit WebSocket `tickers.*` 구독으로 300+ 코인 동시 모니터링
+- **스마트 필터링**: 거래량($1M+), 변동성(2%+) 기준 Top 50 선정
+- **정밀 분석**: 선정된 50개만 `bookticker` + `candle.3` (3초봉) 구독
+- **기회 탐지**:
+  - 볼린저 밴드 슈쿼즈 해제 (BB Squeeze Release)
+  - 호가장 불균형 (Orderbook Imbalance)
+  - 거래량 스파이크 (Volume Spike)
+- **즉시 발행**: RabbitMQ `opportunity-queue`에 실시간 신호 전송
+
+**3단계 점진적 구독 전략**:
+```
+1단계: tickers.* (전체 시장 스캔)
+   ↓
+2단계: Top 50 선정 → bookticker + candle.3 구독
+   ↓
+3단계: 기회 발견 시 → opportunity-queue 발행
+```
 
 **출력 데이터**:
 ```json
 {
-  "scan_id": "scan-20251217-093000",
-  "symbol": "BTCUSDT",
-  "price": 86500.0,
-  "volume_24h": 15000000000.0,
-  "price_change_24h": 3.5,
-  "timestamp": "2025-12-17T09:30:00Z"
+  "event_id": "opp-20251218-154521-001",
+  "symbol": "TAOUSDT",
+  "opportunity_type": "bb_squeeze_release",
+  "volatility_rank": 3,
+  "bb_squeeze_score": 0.94,
+  "ob_imbalance": 0.78,
+  "volume_spike_x": 3.4,
+  "price": 7.52,
+  "timestamp": "2025-12-18T15:45:21Z",
+  "trigger_action": "activate_finder"
 }
 ```
 
+**핵심 모듈**:
+- `scanner_service.py`: 메인 WebSocket 관리 및 오케스트레이션
+- `volatility_ranker.py`: 실시간 변동성 랭킹 (Top 50 선정)
+- `squeeze_detector.py`: 볼린저 밴드 슈쿼즈 감지 (20봉, 2σ)
+- `orderbook_analyzer.py`: 호가장 불균형 분석 (bid/ask 비율)
+- `signal_emitter.py`: RabbitMQ 신호 발행
+- `utils/websocket_client.py`: Bybit WebSocket 연결 관리
+
 **환경 변수**:
-- `MIN_VOLUME_24H`: 1000000 (달러)
-- `MIN_VOLATILITY`: 2.0 (%)
-- `RABBITMQ_QUEUE`: backtest-tasks
+- `BYBIT_WS_URL`: wss://stream.bybit.com/v5/public/linear
+- `MIN_VOLUME_24H`: 1000000 (USD)
+- `MIN_VOLATILITY_PCT`: 2.0 (%)
+- `ACTIVE_SYMBOLS_LIMIT`: 50
+- `BB_SQUEEZE_THRESHOLD`: 0.9
+- `OB_IMBALANCE_THRESHOLD`: 0.7
+- `VOLUME_SPIKE_MULTIPLIER`: 3.0
+- `RABBITMQ_QUEUE`: opportunity-queue
 
 **실행 방식**:
-- EventBridge가 1시간마다 ECS Task로 실행
-- 1회 실행 후 종료 (Run-to-completion)
-- 다음 스케줄까지 대기 (비용 절감)
+- ECS Service로 24/7 상시 실행
+- WebSocket 연결 유지 (재연결 자동 처리)
+- 60초마다 통계 출력 (수신 티커, 발행 기회, 활성 심볼)
+
+**로컬 테스트**:
+```bash
+cd services/scanner
+pip install -r requirements-scanner.txt
+python test_scanner_local.py  # RabbitMQ 없이 콘솔 출력
+```
 
 **코드 위치**:
 - `services/scanner/scanner_service.py`
+- `services/scanner/test_scanner_local.py`
 - `services/scanner/Dockerfile`
+- `services/scanner/README.md`
 
 ---
 
@@ -421,11 +458,39 @@ order = session.place_order(
 
 ## 데이터 흐름
 
-### 전체 파이프라인
+### 전체 파이프라인 (2차 고도화 - 스캘핑 모드)
 
 ```
+🆕 실시간 스캘핑 파이프라인:
+
+1. Scanner Service (24/7 WebSocket 상시 실행)
+   - Bybit WebSocket: tickers.* 구독
+   - 300+ 코인 실시간 모니터링
+   - Top 50 선정 → bookticker + candle.3 구독
+   - 기회 탐지 (BB 슈쿼즈, 호가 불균형, 거래량 스파이크)
+   ↓
+   [RabbitMQ: opportunity-queue]
+   ↓
+2. Finder Service (상시 실행, 1~5개 Auto Scaling)
+   - opportunity-queue 메시지 소비
+   - 실시간 진입 신호 정밀 분석
+   - 200개 최신 봉으로 진입 조건 확인
+   ↓
+   [DynamoDB: trading-positions 저장]
+   ↓
+3. Executor Service (상시 실행, 1개 고정, 5초 주기 스캔)
+   - DynamoDB에서 active 포지션 조회
+   - 진입 조건 확인 (가격, 신뢰도, 스프레드)
+   - 실제 주문 실행
+   ↓
+   [Bybit Exchange]
+
+---
+
+기존 백테스팅 파이프라인 (병행 운영):
+
 1. EventBridge (1시간마다)
-   → Scanner Task 실행
+   → Scanner Task 실행 (기존 방식)
    ↓
    [RabbitMQ: scan-results Queue]
    ↓
@@ -595,9 +660,10 @@ order = session.place_order(
 - **비용**: ~$18/월
 
 **큐 구성**:
-- `scan-results`: Durable, 메시지 TTL 1시간
+- `scan-results`: Durable, 메시지 TTL 1시간 (기존 백테스팅용)
 - `backtest-results`: Durable, 메시지 TTL 1시간
 - `trading-signals`: Durable, 메시지 TTL 30분
+- `opportunity-queue`: 🆕 Durable, 메시지 TTL 5분 (실시간 스캘핑용)
 
 #### 5. ECR (Container Registry)
 - **리포지토리**: 5개 (서비스별)
